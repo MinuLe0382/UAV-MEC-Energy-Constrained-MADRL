@@ -1,0 +1,20 @@
+{
+  "name": "UAV-MEC Baseline",
+  "dockerFile": "../Dockerfile",
+  "context": "..",
+  "runArgs": ["--gpus", "all"],
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/conda/bin/python"
+      },
+      "extensions": [
+        "ms-python.python",
+        "ms-python.pylance"
+      ]
+    }
+  },
+  "remoteUser": "root"
+}
