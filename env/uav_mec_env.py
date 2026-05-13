@@ -58,13 +58,23 @@ class UAVMECEnv:
         self.energy_overrun_base = float(UNSPEC.get("energy_overrun_penalty_base", 1.0))
         self.energy_overrun_per_excess = float(UNSPEC.get("energy_overrun_penalty_per_excess", 0.0))
 
+        # v6 toggle: per-UAV processing queue with f-gated slot capacity
+        self.use_uav_queue = bool(UNSPEC.get("use_uav_queue", False))
+        self.slot_capacity_mode = str(UNSPEC.get("slot_capacity_mode", "identity"))
+        # uav_queue cap: 0 = no cap (v6 original), >0 = force continuous movement
+        _uav_q_max = UNSPEC.get("uav_queue_max", 0)
+        self.uav_queue_max = float(_uav_q_max) if _uav_q_max else float("inf")
+
         self.alpha_dist = alpha_dist
         self.alpha_params = alpha_params or (0.5, 0.2)
 
         self.rng = np.random.default_rng(seed)
 
         # obs: coords(2) + per-SD service(K) + per-UAV total(M) + inter-UAV dist(M-1) + UAV id one-hot(M)
+        # If use_uav_queue is on, also append per-UAV normalized queue level (M).
         self.obs_dim = 2 + self.K + self.M + (self.M - 1) + self.M
+        if self.use_uav_queue:
+            self.obs_dim += self.M
         self.act_dim = 3
 
         # Pre-compute mask used in observation: (M, M) without diagonal
@@ -100,6 +110,10 @@ class UAVMECEnv:
 
         # Queues and cumulative service counts
         self.queue = np.zeros(self.K, dtype=np.float32)
+        # Per-UAV processing buffer (only used when use_uav_queue=true)
+        self.uav_queue = np.zeros(self.M, dtype=np.float32)
+        # Track residual UAV queue at episode end (analysis)
+        self.uav_queue_peak = np.zeros(self.M, dtype=np.float32)
         self.Z = np.zeros((self.M, self.K), dtype=np.float32)
         self.total_bits = 0.0
         # Total task volume generated per SD across the episode (for analysis)
@@ -130,8 +144,38 @@ class UAVMECEnv:
         z = self._service_assignment(self.uav_pos)
 
         # 6. Tasks served per UAV
-        served_load = np.where(z, self.queue[None, :], 0.0)
-        N = served_load.sum(axis=1).astype(np.float32)
+        # Two modes:
+        #   (a) use_uav_queue=False (v5 default): served SD's entire queue is processed
+        #       in the same slot. f does not affect N.
+        #   (b) use_uav_queue=True  (v6):         served SD's queue is moved into a
+        #       per-UAV buffer; this slot's processed bits N is capped by f.
+        if not self.use_uav_queue:
+            served_load = np.where(z, self.queue[None, :], 0.0)
+            N = served_load.sum(axis=1).astype(np.float32)
+            # SD queue gets cleared below.
+            served_active_mask = z & (N[:, None] > 0) & (self.queue[None, :] > 0)
+            served_any = served_active_mask.any(axis=0)
+            served_per_sd_delta = np.where(served_any, self.queue, 0.0).astype(np.float32)
+            self.queue = np.where(served_any, 0.0, self.queue)
+        else:
+            # Step 1: SD queue → uav_queue (transfer)
+            transfer = np.where(z, self.queue[None, :], 0.0).astype(np.float32)  # (M,K)
+            arriving = transfer.sum(axis=1)                                      # (M,)
+            self.uav_queue = np.minimum(
+                self.uav_queue + arriving, self.uav_queue_max
+            ).astype(np.float32)
+            # Mark SD as served (consumed by some UAV)
+            served_any = z.any(axis=0)
+            served_per_sd_delta = np.where(served_any, self.queue, 0.0).astype(np.float32)
+            self.queue = np.where(served_any, 0.0, self.queue)
+            # For Z (cumulative SD-level service count): transfer[m,k] > 0 means
+            # UAV m took SD k's queue this slot.
+            served_active_mask = transfer > 0
+            # Step 2: per-slot processing capacity from f
+            slot_capacity = self._slot_capacity(f)                               # (M,)
+            N = np.minimum(self.uav_queue, slot_capacity).astype(np.float32)
+            self.uav_queue = self.uav_queue - N
+            self.uav_queue_peak = np.maximum(self.uav_queue_peak, self.uav_queue)
 
         # 7. Energy consumption — paper C7 is a soft constraint over the whole episode.
         # UAVs remain active throughout; exceeding the budget is penalized via reward.
@@ -152,13 +196,9 @@ class UAVMECEnv:
         excess = np.maximum(-self.energy_remaining, 0.0).astype(np.float32)
         self.active = self.energy_remaining > 0
 
-        # 9. Update cumulative service counts and clear served queues (vectorized)
-        served_active = z & (N[:, None] > 0) & (self.queue[None, :] > 0)
-        self.Z += served_active.astype(np.float32)
-        served_any = served_active.any(axis=0)
-        # Bits served per SD this slot (entire queue when served)
-        self.served_per_sd += np.where(served_any, self.queue, 0.0).astype(np.float32)
-        self.queue = np.where(served_any, 0.0, self.queue)
+        # 9. Update cumulative service counts (common to both modes)
+        self.Z += served_active_mask.astype(np.float32)
+        self.served_per_sd += served_per_sd_delta
         self.total_bits += float(N.sum())
 
         # 10. Fairness indicators
@@ -199,6 +239,7 @@ class UAVMECEnv:
             "boundary_hit": boundary_hit.copy(),
             "collision_hit": collision_hit.copy(),
             "total_bits": self.total_bits,
+            "uav_queue": self.uav_queue.copy(),
         }
         return self._all_obs(), rewards, done, info
 
@@ -256,6 +297,17 @@ class UAVMECEnv:
         z[best_uav[served_idx], served_idx] = True
         return z
 
+    def _slot_capacity(self, f: np.ndarray) -> np.ndarray:
+        """Map f -> per-slot bit-processing capacity (v6, use_uav_queue=true).
+
+        identity: capacity = f  (bits/slot). With f_max=1e6 and task_mean=1e6,
+        a UAV at f_max can clear roughly 1 task per slot; at f_min=1e4 only
+        ~1% of one task. This makes f choice strongly affect throughput.
+        """
+        if self.slot_capacity_mode == "identity":
+            return f.astype(np.float32)
+        raise ValueError(f"Unknown slot_capacity_mode: {self.slot_capacity_mode}")
+
     def _energy_consumption(self, d: np.ndarray, f: np.ndarray, N: np.ndarray) -> np.ndarray:
         E_tran = self.p_tran * N / self.trans_rate
         E_com = self.k1 * np.power(f, self.k2 - 1) * N * self.cyc
@@ -297,7 +349,15 @@ class UAVMECEnv:
         share = np.broadcast_to(per_uav_total / denom_t / self.K, (self.M, self.M))  # (M, M)
         other_n = other_dists / self.l_max    # (M, M-1)
 
-        obs_block = np.concatenate([coords_n, Z_n, share, other_n, self._uav_ids], axis=1).astype(np.float32)
+        blocks = [coords_n, Z_n, share, other_n, self._uav_ids]
+        if self.use_uav_queue:
+            # Broadcast each UAV's own queue level across rows (M,M) so every agent
+            # sees the full queue vector (centralized obs already mixes per-UAV info via `share`).
+            uq_norm = np.broadcast_to(
+                self.uav_queue / max(self.l_queue_max, 1.0), (self.M, self.M)
+            ).astype(np.float32)
+            blocks.append(uq_norm)
+        obs_block = np.concatenate(blocks, axis=1).astype(np.float32)
         return [obs_block[m] for m in range(self.M)]
 
     # ---------------- evaluation summary ----------------
@@ -313,4 +373,6 @@ class UAVMECEnv:
             "violation_slot": self.violation_slot.tolist(),
             "cumulative_excess": self.cumulative_excess.tolist(),
             "peak_excess": self.peak_excess.tolist(),
+            "uav_queue_final": self.uav_queue.tolist(),
+            "uav_queue_peak": self.uav_queue_peak.tolist(),
         }

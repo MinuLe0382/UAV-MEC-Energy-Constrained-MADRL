@@ -25,6 +25,9 @@ results/
 # Claude
 .claude/
 
+# Presentation context (local working doc, not for repo)
+PRESENTATION_CONTEXT.md
+
 # Environment
 .env
 .venv
